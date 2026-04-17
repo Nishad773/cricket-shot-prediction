@@ -8,113 +8,15 @@ from pathlib import Path
 from typing import Any
 import threading
 
-import av
-import cv2
-import mediapipe as mp
 import streamlit as st
-from streamlit_webrtc import VideoProcessorBase, WebRtcMode, webrtc_streamer
 
 from src.feature_engineering import aggregate_window_features
-from src.pose_estimation import DEFAULT_CONFIDENCE, draw_pose_overlay, estimate_pose_on_frame
-from src.predict import DEFAULT_MODEL_PATH, predict_shot
-from src.predict import _build_feature_frame, load_model
-from src.video_processing import extract_frames
+from src.predict import DEFAULT_MODEL_PATH, _build_feature_frame, load_model, predict_shot
 
 
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
 WEBCAM_WINDOW_SIZE = 24
 WEBCAM_FRAME_SIZE = (224, 224)
 WEBCAM_FRAME_SKIP = 2
-
-
-class LiveShotVideoProcessor(VideoProcessorBase):
-    """Run pose-based shot prediction on streaming webcam frames."""
-
-    def __init__(self) -> None:
-        self.model = load_model(DEFAULT_MODEL_PATH)
-        self.pose = mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=0,
-            min_detection_confidence=DEFAULT_CONFIDENCE,
-            min_tracking_confidence=DEFAULT_CONFIDENCE,
-        )
-        self.keypoint_window: deque[Any] = deque(maxlen=WEBCAM_WINDOW_SIZE)
-        self.frame_index = 0
-        self.latest_label = "Waiting..."
-        self.latest_confidence: float | None = None
-        self.state_lock = threading.Lock()
-
-    def _predict_from_window(self) -> tuple[str | None, float | None]:
-        """Predict a shot label and confidence from buffered keypoints."""
-
-        if len(self.keypoint_window) < 2:
-            return None, None
-
-        feature_map = aggregate_window_features(list(self.keypoint_window))
-        feature_frame = _build_feature_frame(feature_map, self.model)
-        label = self.model.predict(feature_frame)[0]
-
-        confidence = None
-        if hasattr(self.model, "predict_proba"):
-            probabilities = self.model.predict_proba(feature_frame)[0]
-            confidence = float(probabilities.max())
-
-        return str(label), confidence
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        """Process a webcam frame and return an annotated frame."""
-
-        image = frame.to_ndarray(format="bgr24")
-        display_frame = image.copy()
-
-        if self.frame_index % WEBCAM_FRAME_SKIP == 0:
-            resized_frame = cv2.resize(image, WEBCAM_FRAME_SIZE)
-            keypoints, results = estimate_pose_on_frame(
-                resized_frame,
-                pose_model=self.pose,
-                min_visibility=DEFAULT_CONFIDENCE,
-            )
-            self.keypoint_window.append(keypoints)
-
-            overlay_frame = draw_pose_overlay(resized_frame, results)
-            display_frame = cv2.resize(overlay_frame, (image.shape[1], image.shape[0]))
-
-            label, confidence = self._predict_from_window()
-            if label is not None:
-                with self.state_lock:
-                    self.latest_label = label
-                    self.latest_confidence = confidence
-
-        with self.state_lock:
-            label_text = self.latest_label
-            confidence_text = (
-                "--"
-                if self.latest_confidence is None
-                else f"{self.latest_confidence:.2%}"
-            )
-
-        cv2.putText(
-            display_frame,
-            f"Shot: {label_text}",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 0),
-            2,
-        )
-        cv2.putText(
-            display_frame,
-            f"Confidence: {confidence_text}",
-            (20, 75),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2,
-        )
-
-        self.frame_index += 1
-        return av.VideoFrame.from_ndarray(display_frame, format="bgr24")
 
 
 def _save_uploaded_video(uploaded_file: st.runtime.uploaded_file_manager.UploadedFile) -> Path:
@@ -129,9 +31,17 @@ def _save_uploaded_video(uploaded_file: st.runtime.uploaded_file_manager.Uploade
 def _render_pose_overlay(video_path: str | Path) -> object | None:
     """Return a sampled frame with a pose skeleton overlay."""
 
+    import cv2
+    import mediapipe as mp
+
+    from src.video_processing import extract_frames
+
     frames = extract_frames(video_path, target_fps=1.0, frame_size=(480, 270))
     if not frames:
         return None
+
+    mp_drawing = mp.solutions.drawing_utils
+    mp_pose = mp.solutions.pose
 
     with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
         for frame in frames:
@@ -149,6 +59,109 @@ def _render_pose_overlay(video_path: str | Path) -> object | None:
             return overlay_frame
 
     return None
+
+
+def _create_live_video_processor() -> type[Any]:
+    """Create the webcam video processor lazily so imports don't crash app startup."""
+
+    import av
+    import cv2
+    import mediapipe as mp
+    from streamlit_webrtc import VideoProcessorBase
+
+    from src.pose_estimation import DEFAULT_CONFIDENCE, draw_pose_overlay, estimate_pose_on_frame
+
+    mp_pose = mp.solutions.pose
+
+    class LiveShotVideoProcessor(VideoProcessorBase):
+        """Run pose-based shot prediction on streaming webcam frames."""
+
+        def __init__(self) -> None:
+            self.model = load_model(DEFAULT_MODEL_PATH)
+            self.pose = mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=0,
+                min_detection_confidence=DEFAULT_CONFIDENCE,
+                min_tracking_confidence=DEFAULT_CONFIDENCE,
+            )
+            self.keypoint_window: deque[Any] = deque(maxlen=WEBCAM_WINDOW_SIZE)
+            self.frame_index = 0
+            self.latest_label = "Waiting..."
+            self.latest_confidence: float | None = None
+            self.state_lock = threading.Lock()
+
+        def _predict_from_window(self) -> tuple[str | None, float | None]:
+            """Predict a shot label and confidence from buffered keypoints."""
+
+            if len(self.keypoint_window) < 2:
+                return None, None
+
+            feature_map = aggregate_window_features(list(self.keypoint_window))
+            feature_frame = _build_feature_frame(feature_map, self.model)
+            label = self.model.predict(feature_frame)[0]
+
+            confidence = None
+            if hasattr(self.model, "predict_proba"):
+                probabilities = self.model.predict_proba(feature_frame)[0]
+                confidence = float(probabilities.max())
+
+            return str(label), confidence
+
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            """Process a webcam frame and return an annotated frame."""
+
+            image = frame.to_ndarray(format="bgr24")
+            display_frame = image.copy()
+
+            if self.frame_index % WEBCAM_FRAME_SKIP == 0:
+                resized_frame = cv2.resize(image, WEBCAM_FRAME_SIZE)
+                keypoints, results = estimate_pose_on_frame(
+                    resized_frame,
+                    pose_model=self.pose,
+                    min_visibility=DEFAULT_CONFIDENCE,
+                )
+                self.keypoint_window.append(keypoints)
+
+                overlay_frame = draw_pose_overlay(resized_frame, results)
+                display_frame = cv2.resize(overlay_frame, (image.shape[1], image.shape[0]))
+
+                label, confidence = self._predict_from_window()
+                if label is not None:
+                    with self.state_lock:
+                        self.latest_label = label
+                        self.latest_confidence = confidence
+
+            with self.state_lock:
+                label_text = self.latest_label
+                confidence_text = (
+                    "--"
+                    if self.latest_confidence is None
+                    else f"{self.latest_confidence:.2%}"
+                )
+
+            cv2.putText(
+                display_frame,
+                f"Shot: {label_text}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2,
+            )
+            cv2.putText(
+                display_frame,
+                f"Confidence: {confidence_text}",
+                (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2,
+            )
+
+            self.frame_index += 1
+            return av.VideoFrame.from_ndarray(display_frame, format="bgr24")
+
+    return LiveShotVideoProcessor
 
 
 def main() -> None:
@@ -216,14 +229,20 @@ def main() -> None:
         if not model_path.exists():
             st.info("Webcam prediction will be available once `models/model.pkl` exists.")
         else:
-            webrtc_streamer(
-                key="cricket-shot-webcam",
-                mode=WebRtcMode.SENDRECV,
-                media_stream_constraints={"video": True, "audio": False},
-                video_processor_factory=LiveShotVideoProcessor,
-                async_processing=True,
-            )
-            st.caption("Prediction and confidence are drawn directly on the live video feed.")
+            try:
+                from streamlit_webrtc import WebRtcMode, webrtc_streamer
+
+                live_processor = _create_live_video_processor()
+                webrtc_streamer(
+                    key="cricket-shot-webcam",
+                    mode=WebRtcMode.SENDRECV,
+                    media_stream_constraints={"video": True, "audio": False},
+                    video_processor_factory=live_processor,
+                    async_processing=True,
+                )
+                st.caption("Prediction and confidence are drawn directly on the live video feed.")
+            except Exception as error:
+                st.warning(f"Webcam mode is unavailable in this environment: {error}")
 
 
 if __name__ == "__main__":
