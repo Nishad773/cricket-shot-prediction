@@ -80,7 +80,7 @@ def _create_live_video_processor() -> type[Any]:
             self.model = load_model(DEFAULT_MODEL_PATH)
             self.pose = mp_pose.Pose(
                 static_image_mode=False,
-                model_complexity=0,
+                model_complexity=1,
                 min_detection_confidence=DEFAULT_CONFIDENCE,
                 min_tracking_confidence=DEFAULT_CONFIDENCE,
             )
